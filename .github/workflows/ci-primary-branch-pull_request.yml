@@ -1,0 +1,272 @@
+name: Pull Request to primary
+run-name: ""
+"on":
+  pull_request:
+    types:
+      - labeled
+      - opened
+      - reopened
+      - synchronize
+      - unlabeled
+    branches:
+      - main
+jobs:
+  initialize:
+    runs-on:
+      - ubuntu-latest
+    name: Initialize Pipeline
+    steps:
+      - id: branch-check
+        name: Branch Verification
+        run: |2
+          if ! [[ "$GITHUB_HEAD_REF" =~ ^revert-[0-9]+- ]] && ! [[ "$GITHUB_HEAD_REF" =~ ^(feat|feature|fix|bugfix|docs|test|ci|refactor|perf|chore|revert|dependabot)/.* ]]; then
+            echo "ERROR: You can only merge to primary from [^(feat|feature|fix|bugfix|docs|test|ci|refactor|perf|chore|revert|dependabot)/.*]"
+            echo "Current branch: $GITHUB_HEAD_REF"
+            exit 1
+          fi
+        if: github.event_name == 'pull_request'
+      - id: checkout
+        name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - id: validate-commits-push
+        name: Validate Conventional Commits
+        run: |
+          set -euo pipefail
+          PATTERN='^(feat|fix|docs|test|ci|refactor|perf|chore|revert)(\(.+\))?!?: .+'
+          FAILED=0
+          while IFS= read -r msg; do
+            if ! echo "$msg" | grep -Eq "$PATTERN"; then
+              echo "::error::Non-conventional commit: $msg"
+              FAILED=1
+            fi
+          done < <(git log --format='%s' origin/HEAD..HEAD 2>/dev/null || git log --format='%s' -1)
+          if [ "$FAILED" -eq 1 ]; then
+            echo "::error::One or more commits do not follow Conventional Commits (https://www.conventionalcommits.org)"
+            exit 1
+          fi
+          echo "All commits follow Conventional Commits format."
+        if: github.event_name == 'push'
+      - id: validate-pr-title
+        name: Validate Pull Request Title
+        run: |
+          set -euo pipefail
+
+          # --- 0. Use the live title ---
+          # PR_TITLE comes from the triggering event, and "Re-run" replays that event.
+          # Read the current title so that fixing a rejected title and re-running this
+          # job is enough. There is deliberately no "edited" trigger: it would re-run
+          # the whole pipeline on every description edit.
+          LIVE_TITLE=$(gh pr view "$PR_NUM" --repo "$REPO" --json title -q .title 2>/dev/null || true)
+          if [ -n "$LIVE_TITLE" ]; then
+            PR_TITLE="$LIVE_TITLE"
+          fi
+
+          # --- 1. Validate conventional commit format ---
+          PATTERN='^(feat|fix|docs|test|ci|build|style|refactor|perf|chore|revert)(\(.+\))?!?: .+'
+          if ! echo "$PR_TITLE" | grep -Eq "$PATTERN"; then
+            # GitHub's Revert button titles the PR 'Revert "<original title>"'.
+            if echo "$PR_TITLE" | grep -Eq '^Revert ".+"$'; then
+              echo "PR title is a GitHub revert; no release or scope label applied: $PR_TITLE"
+              exit 0
+            fi
+            # Dependabot picks its own title prefix ("Bump x from a to b" unless the
+            # repository configures commit-message.prefix), so its PRs are not blocked.
+            if [ "${PR_AUTHOR:-}" = "dependabot[bot]" ]; then
+              echo "::warning::Dependabot PR title does not follow Conventional Commits, not blocking: $PR_TITLE"
+              exit 0
+            fi
+            echo "::error::PR title does not follow Conventional Commits: $PR_TITLE"
+            echo "Expected format: type(scope): description"
+            echo "Allowed types: feat, fix, docs, test, ci, build, style, refactor, perf, chore, revert"
+            echo "Fix the title, then re-run this job."
+            exit 1
+          fi
+          echo "PR title follows Conventional Commits format."
+
+          # --- 2. Extract type and scope ---
+          TYPE=$(echo "$PR_TITLE" | sed -E 's/^([a-z]+)(\(.+\))?!?:.*/\1/')
+          SCOPE=$(echo "$PR_TITLE" | sed -nE 's/^[a-z]+\(([^)]+)\)!?:.*/\1/p')
+          IS_BREAKING=$(echo "$PR_TITLE" | grep -q '!:' && echo "true" || echo "false")
+          echo "Type: $TYPE | Scope: ${SCOPE:-none} | Breaking: $IS_BREAKING"
+
+          # --- 3. Determine release label ---
+          RELEASE_LABEL=""
+          if [ "$IS_BREAKING" = "true" ]; then
+            RELEASE_LABEL="release/major"
+          elif [ "$TYPE" = "feat" ]; then
+            RELEASE_LABEL="release/minor"
+          fi
+
+          # --- 4. Apply labels via GitHub API ---
+          ensure_label() {
+            gh label create "$1" --repo "$REPO" --force 2>/dev/null || true
+          }
+
+          # Remove stale release labels first
+          EXISTING_LABELS=$(gh pr view "$PR_NUM" --repo "$REPO" --json labels -q '.labels[].name' 2>/dev/null || echo "")
+          for label in release/major release/minor release/patch; do
+            if echo "$EXISTING_LABELS" | grep -qx "$label" && [ "$label" != "$RELEASE_LABEL" ]; then
+              gh pr edit "$PR_NUM" --repo "$REPO" --remove-label "$label" 2>/dev/null || true
+            fi
+          done
+
+          # Labels are advisory: they must never fail this job, because its failure
+          # blocks the merge. gh pr edit fails on a fork PR (read-only token) and on a
+          # label that could not be created, so warn instead of exiting.
+          # Add the release label if determined
+          if [ -n "$RELEASE_LABEL" ]; then
+            ensure_label "$RELEASE_LABEL"
+            if gh pr edit "$PR_NUM" --repo "$REPO" --add-label "$RELEASE_LABEL"; then
+              echo "Applied label: $RELEASE_LABEL"
+            else
+              echo "::warning::could not apply label $RELEASE_LABEL (fork/token or unknown label)"
+            fi
+          fi
+
+          # Add scope label if present. gh splits --add-label on commas, so a
+          # "feat(api,core):" scope would become two labels, one of them unknown.
+          if [ -n "$SCOPE" ]; then
+            SCOPE_LABEL="scope/$(printf '%s' "$SCOPE" | tr ',' '-')"
+            ensure_label "$SCOPE_LABEL"
+            if gh pr edit "$PR_NUM" --repo "$REPO" --add-label "$SCOPE_LABEL"; then
+              echo "Applied scope label: $SCOPE_LABEL"
+            else
+              echo "::warning::could not apply label $SCOPE_LABEL (fork/token or unknown label)"
+            fi
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_NUM: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          REPO: ${{ github.repository }}
+        if: github.event_name == 'pull_request'
+      - id: compute-version
+        name: Compute Version
+        run: |
+          set -euo pipefail
+
+          RELEASE_TYPE="LATEST"
+          DEFAULT_BUMP="patch"
+          EVENT_NAME="${{ github.event_name }}"
+
+          # --- 1. Determine bump level from PR labels ---
+          LABELS=""
+          if [ "$EVENT_NAME" = "push" ]; then
+            PR_JSON=$(gh api repos/${{ github.repository }}/commits/${{ github.sha }}/pulls --jq '.[0]' 2>/dev/null || echo "")
+            if [ -n "$PR_JSON" ] && [ "$PR_JSON" != "null" ]; then
+              LABELS=$(echo "$PR_JSON" | jq -r '.labels[].name // empty' 2>/dev/null || echo "")
+            fi
+          elif [ "$EVENT_NAME" = "pull_request" ]; then
+            LABELS=$(gh pr view "${{ github.event.pull_request.number }}" --json labels -q '.labels[].name' 2>/dev/null || echo "")
+          fi
+
+          BUMP=""
+          if echo "${LABELS}" | grep -q "release/major"; then
+            BUMP="major"
+          elif echo "${LABELS}" | grep -q "release/minor"; then
+            BUMP="minor"
+          elif echo "${LABELS}" | grep -q "release/patch"; then
+            BUMP="patch"
+          fi
+          if [ -z "$BUMP" ]; then
+            BUMP="$DEFAULT_BUMP"
+          fi
+          echo "Bump level: $BUMP"
+
+          BASE_TAG=$(git tag -l 'v*' --sort=-version:refname --merged HEAD | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || true)
+          if [ -z "$BASE_TAG" ]; then
+            BASE_TAG="v0.0.0"
+          fi
+          echo "Base tag: $BASE_TAG"
+
+          SKIP="false"
+          case "$RELEASE_TYPE" in
+            LATEST)
+              VERSION="${BASE_TAG#v}"
+              IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
+              case "$BUMP" in
+                major) MAJOR=$((MAJOR+1)); MINOR=0; PATCH=0 ;;
+                minor) MINOR=$((MINOR+1)); PATCH=0 ;;
+                patch) PATCH=$((PATCH+1)) ;;
+              esac
+              TARGET="v${MAJOR}.${MINOR}.${PATCH}"
+              ;;
+            HOTFIX|BETA|ALPHA)
+              PREFIX_TAG=$(echo "$RELEASE_TYPE" | tr '[:upper:]' '[:lower:]')
+              LATEST_PRE=$(git tag -l "${BASE_TAG}-${PREFIX_TAG}.*" --sort=-version:refname | head -n 1 || true)
+              if [ -z "$LATEST_PRE" ]; then
+                SUFFIX=0
+              else
+                SUFFIX=$(echo "$LATEST_PRE" | grep -oE '[0-9]+$')
+                SUFFIX=$((SUFFIX+1))
+              fi
+              TARGET="${BASE_TAG}-${PREFIX_TAG}.${SUFFIX}"
+              ;;
+            NONE|*)
+              echo "Release type '$RELEASE_TYPE' does not publish tags - skipping"
+              TARGET="$BASE_TAG"
+              SKIP="true"
+              ;;
+          esac
+
+          EXISTING_TAGS=$(git tag --points-at HEAD 2>/dev/null | grep -E '^v[0-9]+' | head -n 1 || true)
+          if [ -n "$EXISTING_TAGS" ]; then
+            echo "Commit already tagged with: $EXISTING_TAGS - skipping pipeline"
+            SKIP="true"
+          fi
+
+          echo "current_version=$BASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "target_version=$TARGET" >> "$GITHUB_OUTPUT"
+          echo "skip=$SKIP" >> "$GITHUB_OUTPUT"
+          echo "Computed version: $TARGET (skip=$SKIP)"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    outputs:
+      current_version: ${{ steps.compute-version.outputs.current_version }}
+      skip: ${{ steps.compute-version.outputs.skip }}
+      target_version: ${{ steps.compute-version.outputs.target_version }}
+    permissions:
+      contents: read
+      pull-requests: write
+  island-venues-notifier-ci:
+    name: CI [island-venues-notifier]
+    needs:
+      - initialize
+    with:
+      current_version: ${{ needs.initialize.outputs.current_version }}
+      target_version: ${{ needs.initialize.outputs.target_version }}
+    secrets: inherit
+    uses: a-manraj-infrastream/default-managed-workflows-public/.github/workflows/island-venues-notifier-island-venues-notifier-primary-branch-pull_request.yml@main
+  merge-authorized:
+    runs-on:
+      - ubuntu-latest
+    name: Merge Authorized
+    steps:
+      - id: merge-blocked
+        name: Block merge on failed or cancelled jobs or a cancelled run
+        run: |
+          echo "::error::A required job failed or was cancelled, or the run was cancelled; merge is not authorized."
+          echo "$NEEDS_RESULTS"
+          exit 1
+        env:
+          NEEDS_RESULTS: ${{ toJSON(needs) }}
+        if: ${{ cancelled() || contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+      - id: merge-authorized
+        name: Merge Authorized
+        run: echo 'Authorized!'
+    needs:
+      - initialize
+      - island-venues-notifier-ci
+    permissions: {}
+    if: ${{ always() }}
+permissions:
+  actions: write
+  checks: write
+  contents: write
+  id-token: write
+  pull-requests: write
+  security-events: write
