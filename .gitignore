@@ -1,0 +1,18 @@
+# Binaries
+/island-venues-notifier
+/main
+/dist/
+*.exe
+*.test
+*.out
+coverage.*
+
+# Local environment
+.env
+.env.*
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
