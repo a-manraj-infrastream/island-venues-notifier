@@ -46,10 +46,11 @@ after a few attempts instead of being retried until it expires.
 
 `GET /healthz` returns `ok`.
 
-The service does not authenticate pushes itself: whoever can call `POST /`
-can make it e-mail any address with the fixed template. Keep the Cloud Run
-service private (IAM `run.invoker` granted only to the Eventarc trigger's
-service account) and its ingress internal.
+`POST /` only accepts Eventarc. The engine deploys Cloud Run with its invoker
+IAM check disabled, so the platform would let anything that reaches the
+service call it and have it e-mail any address. The service therefore checks
+the Google OIDC token Eventarc attaches to every push and answers `401`,
+before reading the body, unless the token belongs to `PUSH_SERVICE_ACCOUNT`.
 
 ### Observability
 
@@ -78,7 +79,7 @@ Requires Go 1.26 or later.
 
 ```sh
 go test ./...
-go run main.go            # listens on :8080, logs e-mails instead of sending
+DEV_MODE=true go run main.go   # listens on :8080, logs e-mails instead of sending
 ```
 
 Send it an event:
@@ -89,6 +90,8 @@ curl -s -d "{\"message\":{\"data\":\"$DATA\",\"messageId\":\"1\"},\"subscription
 ```
 
 Set `SENDGRID_API_KEY` and `SENDER_EMAIL` to send real e-mails.
+
+The service refuses to start without `PUSH_SERVICE_ACCOUNT`; `DEV_MODE=true` is for local runs only.
 
 ## Environment variables
 
@@ -101,6 +104,9 @@ Set `SENDGRID_API_KEY` and `SENDER_EMAIL` to send real e-mails.
 | `SERVICE_NAME` | `island-venues-notifier` | Service name in traces and profiles. |
 | `SERVICE_VERSION` | `RELEASE_VERSION`, else `INFRASTREAM_APP_VERSION`, else empty | Version in traces and profiles. The engine-built image sets `RELEASE_VERSION` and the engine sets `INFRASTREAM_APP_VERSION`. |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARN` or `ERROR`. |
+| `PUSH_SERVICE_ACCOUNT` | *(unset: refuses to start)* | E-mail of the Eventarc trigger's service account. Only pushes with a Google OIDC token for this identity (`email` matches, `email_verified` true, issuer `accounts.google.com`) reach the handler; anything else gets `401` before the body is read. The engine runs the trigger as the application's own account, `app-23ff2ba10851@<project>.iam.gserviceaccount.com`. |
+| `PUSH_AUDIENCE` | *(unset: `https://` + request host)* | Accepted token audiences, comma-separated. Eventarc uses the Cloud Run service URL, which only exists after the first deploy, so by default the audience is taken from the request host. |
+| `DEV_MODE` | *(unset)* | `true` accepts unauthenticated pushes for local runs. Refused on Cloud Run (`K_SERVICE` set). |
 
 ## Deployment
 

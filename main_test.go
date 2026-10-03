@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -10,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/a-manraj-infrastream/island-venues-notifier/internal/mailer"
+	"google.golang.org/api/idtoken"
 )
 
 func env(m map[string]string) func(string) string {
@@ -97,4 +100,64 @@ func TestRouter(t *testing.T) {
 	if pushed != 1 {
 		t.Errorf("push handler called %d times, want 1", pushed)
 	}
+}
+
+// TestPushGuard: the service fails closed. Without a push identity it only
+// starts in DEV_MODE, and never in DEV_MODE on Cloud Run.
+func TestPushGuard(t *testing.T) {
+	quiet := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	cases := []struct {
+		name     string
+		env      map[string]string
+		wantErr  string
+		wantOpen bool // an unauthenticated POST reaches the handler
+	}{
+		{"push identity set", map[string]string{"PUSH_SERVICE_ACCOUNT": "sa@p.iam.gserviceaccount.com"}, "", false},
+		{"push identity on Cloud Run", map[string]string{"PUSH_SERVICE_ACCOUNT": "sa@p.iam.gserviceaccount.com", "K_SERVICE": "notifier"}, "", false},
+		{"dev mode locally", map[string]string{"DEV_MODE": "true"}, "", true},
+		{"dev mode on Cloud Run", map[string]string{"DEV_MODE": "true", "K_SERVICE": "notifier"}, "DEV_MODE=true is refused on Cloud Run", false},
+		{"nothing configured", nil, "PUSH_SERVICE_ACCOUNT is not set", false},
+		{"nothing configured on Cloud Run", map[string]string{"K_SERVICE": "notifier"}, "PUSH_SERVICE_ACCOUNT is not set", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			guard, err := pushGuard(loadConfig(env(c.env)), rejectAll{}, quiet)
+			if c.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), c.wantErr) {
+					t.Fatalf("err = %v, want %q", err, c.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			reached := false
+			h := guard(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { reached = true }))
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/", strings.NewReader("{}")))
+			if reached != c.wantOpen {
+				t.Fatalf("unauthenticated push reached handler = %v, want %v (status %d)", reached, c.wantOpen, rec.Code)
+			}
+			if !c.wantOpen && rec.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401", rec.Code)
+			}
+		})
+	}
+}
+
+func TestLoadConfigPushAudiences(t *testing.T) {
+	cfg := loadConfig(env(map[string]string{"PUSH_AUDIENCE": " https://a.run.app , ,https://b.example ", "PUSH_SERVICE_ACCOUNT": "sa@p.iam.gserviceaccount.com\n"}))
+	if len(cfg.PushAudiences) != 2 || cfg.PushAudiences[0] != "https://a.run.app" || cfg.PushAudiences[1] != "https://b.example" {
+		t.Errorf("audiences = %q", cfg.PushAudiences)
+	}
+	if cfg.PushServiceAccount != "sa@p.iam.gserviceaccount.com" {
+		t.Errorf("service account not trimmed: %q", cfg.PushServiceAccount)
+	}
+}
+
+// rejectAll never validates a token.
+type rejectAll struct{}
+
+func (rejectAll) Validate(context.Context, string, string) (*idtoken.Payload, error) {
+	return nil, errors.New("invalid")
 }

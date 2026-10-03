@@ -19,7 +19,9 @@ import (
 
 	"github.com/a-manraj-infrastream/island-venues-notifier/internal/delivery"
 	"github.com/a-manraj-infrastream/island-venues-notifier/internal/mailer"
+	"github.com/a-manraj-infrastream/island-venues-notifier/internal/pushauth"
 	"github.com/a-manraj-infrastream/island-venues-notifier/internal/telemetry"
+	"google.golang.org/api/idtoken"
 )
 
 const (
@@ -41,6 +43,16 @@ type config struct {
 	SendGridAPIKey string
 	SenderEmail    string
 	LogLevel       slog.Level
+	// PushServiceAccount is the Eventarc trigger's service account; only
+	// pushes carrying a Google OIDC token for it are accepted.
+	PushServiceAccount string
+	// PushAudiences are the accepted token audiences (comma-separated in
+	// PUSH_AUDIENCE). Empty means "https://" + the request Host.
+	PushAudiences []string
+	// DevMode accepts unauthenticated pushes. Local runs only.
+	DevMode bool
+	// OnCloudRun is true when K_SERVICE is set by Cloud Run.
+	OnCloudRun bool
 }
 
 func loadConfig(getenv func(string) string) config {
@@ -56,6 +68,16 @@ func loadConfig(getenv func(string) string) config {
 		// contain surrounding whitespace.
 		SendGridAPIKey: strings.TrimSpace(getenv("SENDGRID_API_KEY")),
 		SenderEmail:    strings.TrimSpace(getenv("SENDER_EMAIL")),
+		// Same trailing-newline risk as the secrets above: a stray newline
+		// would make every e-mail comparison fail and reject every push.
+		PushServiceAccount: strings.TrimSpace(getenv("PUSH_SERVICE_ACCOUNT")),
+		DevMode:            getenv("DEV_MODE") == "true",
+		OnCloudRun:         getenv("K_SERVICE") != "",
+	}
+	for _, aud := range strings.Split(getenv("PUSH_AUDIENCE"), ",") {
+		if aud = strings.TrimSpace(aud); aud != "" {
+			cfg.PushAudiences = append(cfg.PushAudiences, aud)
+		}
 	}
 	if cfg.Port == "" {
 		cfg.Port = defaultPort
@@ -103,6 +125,26 @@ func newMailer(cfg config, logger *slog.Logger) (delivery.Mailer, error) {
 	return sg, nil
 }
 
+// pushGuard decides how pushes are authenticated, failing closed.
+//   - PUSH_SERVICE_ACCOUNT set: only verified Eventarc OIDC tokens get in.
+//   - DEV_MODE=true and not on Cloud Run: no check (local development).
+//   - anything else: refuse to start, because the engine disables Cloud Run's
+//     invoker check and the service would otherwise e-mail on anyone's behalf.
+func pushGuard(cfg config, v pushauth.Verifier, logger *slog.Logger) (func(http.Handler) http.Handler, error) {
+	if cfg.PushServiceAccount != "" {
+		pc := pushauth.Config{ServiceAccount: cfg.PushServiceAccount, Audiences: cfg.PushAudiences}
+		return func(next http.Handler) http.Handler { return pushauth.Require(v, pc, logger, next) }, nil
+	}
+	if cfg.DevMode {
+		if cfg.OnCloudRun {
+			return nil, errors.New("DEV_MODE=true is refused on Cloud Run (K_SERVICE is set): set PUSH_SERVICE_ACCOUNT instead")
+		}
+		logger.Warn("DEV_MODE: pushes are not authenticated; never use this outside a local run")
+		return func(next http.Handler) http.Handler { return next }, nil
+	}
+	return nil, errors.New("PUSH_SERVICE_ACCOUNT is not set: refusing to accept unauthenticated pushes (set DEV_MODE=true for a local run)")
+}
+
 // newRouter registers every route, each wrapped in an OpenTelemetry server
 // span.
 func newRouter(push http.Handler) http.Handler {
@@ -143,6 +185,16 @@ func run() error {
 		logger.Warn("profiler disabled", slog.Any("error", err))
 	}
 
+	verifier, err := idtoken.NewValidator(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to create the push token validator: %w", err)
+	}
+	guard, err := pushGuard(cfg, verifier, logger)
+	if err != nil {
+		_ = shutdownTracing(context.Background())
+		return err
+	}
+
 	m, err := newMailer(cfg, logger)
 	if err != nil {
 		return err
@@ -154,7 +206,7 @@ func run() error {
 
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,
-		Handler:           newRouter(push),
+		Handler:           newRouter(guard(push)),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,
